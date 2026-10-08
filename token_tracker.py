@@ -475,6 +475,7 @@ class Tracker:
         self.session.clear()
         self.last_model = None
         self.last_usage = None
+        self.ctx_override = None   # context size right after a /compact
 
     def feed(self, line):
         try:
@@ -485,6 +486,11 @@ class Tracker:
             return
         if is_new_prompt(obj):
             self.turn = {}
+            return
+        if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            post = (obj.get("compactMetadata") or {}).get("postTokens")
+            if isinstance(post, int):
+                self.ctx_override = post   # until the next reply reports real usage
             return
         msg = obj.get("message")
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
@@ -497,6 +503,7 @@ class Tracker:
         self.turn[mid] = (model, usage)  # same message is logged repeatedly; last wins
         self.session[mid] = sum(cost_parts_usd(model, usage))
         self.last_model, self.last_usage = model, usage
+        self.ctx_override = None
 
     def render(self):
         rate = self.rate.value
@@ -525,6 +532,8 @@ class Tracker:
         if self.last_usage:
             inp, _o, cr, c5m, c1h = split_usage(self.last_usage)
             ctx = inp + cr + c5m + c1h
+            if self.ctx_override is not None:
+                ctx = self.ctx_override
             limit = context_limit(self.last_model)
             self.ctx_val.config(text=f"{fmt(ctx)} / {fmt(limit // 1000)}k")
             self.bar.coords(self.bar_fill, 0, 0, 240 * min(1.0, ctx / limit), 5)
