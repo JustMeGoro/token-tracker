@@ -8,7 +8,8 @@ Controls: drag = move, double-click / right-click / x = close.
 Hover a label or value for an explanation.
 
 Settings (environment variables):
-  TOKEN_TRACKER_CURRENCY   USD (default) or CZK (uses the daily CNB rate)
+  TOKEN_TRACKER_CURRENCY   USD (default), EUR, GBP, CZK, PLN, CHF, JPY, CAD, AUD,
+                           CNY, INR, SEK, NOK, DKK, KRW, BRL, MXN (daily ECB rate)
   TOKEN_TRACKER_HOST_EXE   exe whose window must be in front for the tracker to
                            show (default claude.exe). Set to "any" to always show.
 """
@@ -26,7 +27,29 @@ LOG_ROOT = Path.home() / ".claude" / "projects"
 POLL_MS = 500
 RESCAN_EVERY = 4  # every Nth poll looks for the newest/focused log (~2 s)
 
+# code: (symbol, decimals, symbol after the number, rough fallback rate per 1 USD)
+CURRENCIES = {
+    "USD": ("$", 2, False, 1.0),
+    "EUR": ("€", 2, False, 0.90),
+    "GBP": ("£", 2, False, 0.77),
+    "CZK": ("Kč", 2, True, 22.0),
+    "PLN": ("zł", 2, True, 3.8),
+    "CHF": ("CHF", 2, True, 0.80),
+    "JPY": ("¥", 0, False, 150.0),
+    "CAD": ("C$", 2, False, 1.37),
+    "AUD": ("A$", 2, False, 1.50),
+    "CNY": ("CN¥", 2, False, 7.2),
+    "INR": ("₹", 2, False, 84.0),
+    "SEK": ("kr", 2, True, 10.5),
+    "NOK": ("kr", 2, True, 10.8),
+    "DKK": ("kr", 2, True, 6.8),
+    "KRW": ("₩", 0, False, 1380.0),
+    "BRL": ("R$", 2, False, 5.5),
+    "MXN": ("MX$", 2, False, 18.5),
+}
 CURRENCY = os.environ.get("TOKEN_TRACKER_CURRENCY", "USD").upper()
+if CURRENCY not in CURRENCIES:
+    CURRENCY = "USD"
 HOST_EXE = os.environ.get("TOKEN_TRACKER_HOST_EXE", "claude.exe").lower()
 VIS_POLL_MS = 250
 
@@ -59,9 +82,7 @@ PRICES = [
     ("haiku", 1.0, 5.0),
 ]
 DEFAULT_PRICE = (5.0, 25.0)  # unknown model = pessimistic estimate
-FALLBACK_CZK = 22.0
-CNB_URL = ("https://www.cnb.cz/cs/financni-trhy/devizovy-trh/"
-           "kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt")
+RATE_URL = "https://api.frankfurter.dev/v1/latest?base=USD&symbols="  # ECB rates, no key
 RATE_REFRESH_S = 3600
 
 # --- Palette (Claude Desktop dark mode)
@@ -164,35 +185,37 @@ def fmt(n):
 
 
 def fmt_money(usd, rate):
-    if CURRENCY == "CZK":
-        return f"{usd * rate:,.2f}".replace(",", " ").replace(".", ",") + " Kč"
-    return f"${usd:,.4f}" if usd < 0.1 else f"${usd:,.2f}"
+    sym, dec, after, _fb = CURRENCIES[CURRENCY]
+    amount = usd * rate
+    if CURRENCY == "USD" and amount < 0.1:
+        dec = 4
+    text = f"{amount:,.{dec}f}"
+    if after:  # European style: 1 234,56 Kč
+        return text.replace(",", " ").replace(".", ",") + " " + sym
+    return sym + text
 
 
 class Rate:
-    """USD->CZK rate from the Czech National Bank, fetched in the background."""
+    """USD->selected currency rate from the ECB (via frankfurter.dev), fetched in the background."""
 
     def __init__(self):
-        self.value = FALLBACK_CZK
+        self.value = CURRENCIES[CURRENCY][3]
         self.live = False
         self._last = 0.0
 
     def maybe_refresh(self):
-        if CURRENCY != "CZK" or time.time() - self._last < RATE_REFRESH_S:
+        if CURRENCY == "USD" or time.time() - self._last < RATE_REFRESH_S:
             return
         self._last = time.time()
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self):
         try:
-            with urllib.request.urlopen(CNB_URL, timeout=8) as r:
-                text = r.read().decode("utf-8", "replace")
-            for line in text.splitlines():
-                parts = line.split("|")
-                if len(parts) == 5 and parts[3] == "USD":
-                    self.value = float(parts[4].replace(",", ".")) / float(parts[2])
-                    self.live = True
-                    return
+            req = urllib.request.Request(RATE_URL + CURRENCY,
+                                         headers={"User-Agent": "token-tracker"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                self.value = float(json.load(r)["rates"][CURRENCY])
+            self.live = True
         except Exception:
             self._last = time.time() - RATE_REFRESH_S + 120  # retry in 2 min
 
@@ -506,12 +529,12 @@ class Tracker:
             self.ctx_val.config(text=f"{fmt(ctx)} / {fmt(limit // 1000)}k")
             self.bar.coords(self.bar_fill, 0, 0, 240 * min(1.0, ctx / limit), 5)
             self.model_lbl.config(text=(self.last_model or "").replace("claude-", ""))
-        if CURRENCY == "CZK":
-            self.foot.config(
-                text=f"1 USD = {rate:.2f} CZK "
-                + ("(CNB)" if self.rate.live else "(estimate, rate not fetched)"))
-        else:
+        if CURRENCY == "USD":
             self.foot.config(text="prices: API list estimate, USD")
+        else:
+            self.foot.config(
+                text=f"1 USD = {rate:,.2f} {CURRENCY} "
+                + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)"))
 
     def switch_to(self, path):
         """Switch to a log file and replay its whole history."""

@@ -9,7 +9,7 @@ A small always-on-top overlay for **Claude Desktop (Windows)** that shows how ma
 - Follows the chat you have focused in Claude Desktop (switches within ~2 s)
 - Shows only while Claude Desktop is in front; drag to move, double-click or right-click to close
 
-It reads the local Claude Code logs in `~/.claude/projects`. Nothing is sent anywhere (the optional CZK mode only downloads the public CNB exchange rate).
+It reads the local Claude Code logs in `~/.claude/projects`. Nothing is sent anywhere (non-USD modes only download the public ECB exchange rate from frankfurter.dev).
 
 ## Requirements
 
@@ -39,10 +39,12 @@ Environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TOKEN_TRACKER_CURRENCY` | `USD` | `USD` or `CZK` (converted with the daily CNB rate) |
+| `TOKEN_TRACKER_CURRENCY` | `USD` | Display currency, converted with the daily ECB rate: `USD` `EUR` `GBP` `CZK` `PLN` `CHF` `JPY` `CAD` `AUD` `CNY` `INR` `SEK` `NOK` `DKK` `KRW` `BRL` `MXN` |
 | `TOKEN_TRACKER_HOST_EXE` | `claude.exe` | Window that must be in front for the overlay to show; `any` = always visible |
 
 Prices are the `PRICES` table at the top of `token_tracker.py`. They are list-price estimates, so edit them if pricing changes. Unknown models use a pessimistic default.
+
+To make a currency permanent: `setx TOKEN_TRACKER_CURRENCY EUR`, then restart Claude Desktop. To add another currency, add a line to the `CURRENCIES` table in `token_tracker.py` (any code supported by [frankfurter.dev](https://frankfurter.dev)).
 
 ## How chat-following works
 
