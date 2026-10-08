@@ -1,0 +1,11 @@
+{
+  "name": "token-tracker",
+  "owner": { "name": "JustMeGoro" },
+  "plugins": [
+    {
+      "name": "token-tracker",
+      "source": "./",
+      "description": "Always-on-top overlay showing token usage and estimated cost of the focused Claude Desktop chat"
+    }
+  ]
+}
