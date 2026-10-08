@@ -1,7 +1,7 @@
 {
   "name": "token-tracker",
   "description": "Always-on-top overlay showing token usage and estimated cost of the focused Claude Desktop chat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": { "name": "JustMeGoro" },
   "license": "MIT",
   "keywords": ["tokens", "cost", "usage", "claude-desktop", "windows"]

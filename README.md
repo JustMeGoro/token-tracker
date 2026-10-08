@@ -3,7 +3,7 @@
 A small always-on-top overlay for **Claude Desktop (Windows)** that shows how many tokens, and roughly how much money, your last request and the whole chat used.
 
 - Cost of the last request, including the whole reply and tool calls
-- Cost of the whole session
+- Cost of the whole chat, summed across `/clear` and compaction (earlier logs listed in `priorCliSessionIds` are included)
 - Input / output / cache read / cache write tokens, each with its cost
 - Context window usage bar
 - Follows the chat you have focused in Claude Desktop (switches within ~2 s)

@@ -263,13 +263,26 @@ def newest_log():
     return newest
 
 
-_sess_cache = {}  # metadata path -> (mtime, cliSessionId, lastFocusedAt)
+_sess_cache = {}  # metadata path -> (mtime, cliSessionId, lastFocusedAt, priorCliSessionIds)
 _log_by_id = {}   # cliSessionId -> path to .jsonl
 
 
+def _find_log(cid):
+    path = _log_by_id.get(cid)
+    if not path or not os.path.exists(path):
+        path = None
+        for d in LOG_ROOT.glob(f"*/{cid}.jsonl"):
+            path = str(d)
+            _log_by_id[cid] = path
+            break
+    return path
+
+
 def focused_log():
-    """Log of the chat last focused in Claude Desktop, or None."""
-    best = None  # (lastFocusedAt, cliSessionId)
+    """(log path, [paths of earlier logs of the same chat]) of the chat last
+    focused in Claude Desktop, or None. /clear and compaction start a new log;
+    Desktop lists the older ones in priorCliSessionIds."""
+    best = None  # (lastFocusedAt, cliSessionId, priorCliSessionIds)
     seen = set()
     walks = (w for root in SESSIONS_ROOTS if root.is_dir() for w in os.walk(root))
     for dirpath, _dirs, files in walks:
@@ -283,26 +296,65 @@ def focused_log():
                 if _sess_cache.get(p, (None,))[0] != m:
                     with open(p, "rb") as f:
                         d = json.load(f)
+                    prior = d.get("priorCliSessionIds")
                     _sess_cache[p] = (m, d.get("cliSessionId"),
-                                      d.get("lastFocusedAt") or 0)
+                                      d.get("lastFocusedAt") or 0,
+                                      prior if isinstance(prior, list) else [])
             except (OSError, ValueError):
                 continue
-            _m, cid, focus = _sess_cache[p]
+            _m, cid, focus, prior = _sess_cache[p]
             if cid and (best is None or focus > best[0]):
-                best = (focus, cid)
+                best = (focus, cid, prior)
     for p in set(_sess_cache) - seen:
         del _sess_cache[p]
     if not best:
         return None
-    cid = best[1]
-    path = _log_by_id.get(cid)
-    if not path or not os.path.exists(path):
-        path = None
-        for d in LOG_ROOT.glob(f"*/{cid}.jsonl"):
-            path = str(d)
-            _log_by_id[cid] = path
-            break
-    return path
+    path = _find_log(best[1])
+    if not path:
+        return None
+    older = []
+    for pid in best[2]:
+        if isinstance(pid, str) and pid != best[1]:
+            pp = _find_log(pid)
+            if pp and pp != path and pp not in older:
+                older.append(pp)
+    return path, older
+
+
+_old_cache = {}  # earlier log path -> (mtime, {message id: USD})
+
+
+def log_costs(path):
+    """{message id: USD} of every reply in an earlier log (cached by mtime)."""
+    try:
+        m = os.path.getmtime(path)
+    except OSError:
+        return {}
+    hit = _old_cache.get(path)
+    if hit and hit[0] == m:
+        return hit[1]
+    costs = {}
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                if b'"usage"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                msg = obj.get("message") if isinstance(obj, dict) else None
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                usage, model = msg.get("usage"), msg.get("model")
+                if not isinstance(usage, dict) or model == "<synthetic>":
+                    continue
+                mid = msg.get("id") or obj.get("uuid") or f"{path}:{len(costs)}"
+                costs[mid] = sum(cost_parts_usd(model, usage))
+    except OSError:
+        pass
+    _old_cache[path] = (m, costs)
+    return costs
 
 
 def is_new_prompt(obj):
@@ -327,7 +379,10 @@ class Tracker:
         self.offset = 0
         self.tick = 0
         self.turn = {}      # message id -> (model, usage) for the current request
-        self.session = {}   # message id -> USD cost for the whole session
+        self.session = {}   # message id -> USD cost for the current log
+        self.older = []     # earlier logs of this chat (before /clear or compaction)
+        self.older_merged = {}  # message id -> USD over those logs
+        self.older_usd = 0.0
         self.last_model = None
         self.last_usage = None
         self.values = {}
@@ -383,7 +438,8 @@ class Tracker:
                                  font=(MONO, 10, "bold"), anchor="e")
         self.sess_val.pack(side="right", padx=(0, 10))
         Tooltip([sess, s_name, self.sess_val],
-                "Sum of all replies in this log (session).")
+                "Sum of all replies in this chat, including the logs from\n"
+                "before /clear or compaction.")
 
         # --- token and cost rows
         grid = tk.Frame(frame, bg=BG)
@@ -473,6 +529,8 @@ class Tracker:
     def reset(self):
         self.turn.clear()
         self.session.clear()
+        self.older_merged = {}
+        self.older_usd = 0.0
         self.last_model = None
         self.last_usage = None
         self.ctx_override = None   # context size right after a /compact
@@ -526,8 +584,9 @@ class Tracker:
         self.hero_sub.config(
             text=f"last request incl. reply · {n} model calls" if n > 1
             else "last request incl. reply")
-        self.sess_val.config(text=fmt_money(sum(self.session.values()), rate)
-                             if self.session else "–")
+        total = sum(self.session.values()) + self.older_usd
+        self.sess_val.config(text=fmt_money(total, rate)
+                             if (self.session or self.older_usd) else "–")
 
         if self.last_usage:
             inp, _o, cr, c5m, c1h = split_usage(self.last_usage)
@@ -545,7 +604,20 @@ class Tracker:
                 text=f"1 USD = {rate:,.2f} {CURRENCY} "
                 + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)"))
 
-    def switch_to(self, path):
+    def load_older(self, older):
+        """Cost of the chat's earlier logs, shown in the whole-session total."""
+        self.older = list(older)
+        self.older_merged = {}
+        for p in self.older:
+            self.older_merged.update(log_costs(p))
+        self.update_older_usd()
+
+    def update_older_usd(self):
+        # a reply copied into the current log (rewind/fork) is not counted twice
+        self.older_usd = sum(c for mid, c in self.older_merged.items()
+                             if mid not in self.session)
+
+    def switch_to(self, path, older=()):
         """Switch to a log file and replay its whole history."""
         self.path = path
         self.reset()
@@ -557,13 +629,14 @@ class Tracker:
                 self.feed(line)
         except OSError:
             self.offset = 0
+        self.load_older(older)
         self.render()
 
     def read_new(self):
         try:
             size = os.path.getsize(self.path)
             if size < self.offset:  # file truncated/rewritten
-                self.switch_to(self.path)
+                self.switch_to(self.path, self.older)
                 return
             if size == self.offset:
                 return
@@ -576,6 +649,7 @@ class Tracker:
             self.offset += end + 1
             for line in chunk[:end].decode("utf-8", "replace").splitlines():
                 self.feed(line)
+            self.update_older_usd()
             self.render()
         except OSError:
             pass
@@ -583,9 +657,13 @@ class Tracker:
     def poll(self):
         self.rate.maybe_refresh()
         if self.path is None or self.tick % RESCAN_EVERY == 0:
-            latest = focused_log() or newest_log()
+            found = focused_log()
+            latest, older = found if found else (newest_log(), [])
             if latest and latest != self.path:
-                self.switch_to(latest)
+                self.switch_to(latest, older)
+            elif latest and older != self.older:
+                self.load_older(older)
+                self.render()
         self.tick += 1
         if self.path:
             self.read_new()
