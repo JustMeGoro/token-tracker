@@ -48,7 +48,7 @@ To make a currency permanent: `setx TOKEN_TRACKER_CURRENCY EUR`, then restart Cl
 
 ## How chat-following works
 
-Claude Desktop stores one metadata file per chat (`claude-code-sessions/**/local_*.json`) containing `lastFocusedAt` and the log's session id. The tracker shows the log of the chat with the newest `lastFocusedAt`, and falls back to the most recently written log. Both the Store-package and classic `%APPDATA%` locations are checked.
+Claude Desktop stores one metadata file per chat (`claude-code-sessions/**/local_*.json`) containing `lastFocusedAt` and the log's session id. The tracker shows the log of the chat with the newest `lastFocusedAt`, and falls back to the most recently written log. The Store-package, classic `%APPDATA%` and newer `%LOCALAPPDATA%\Claude-Data` locations are all checked (re-discovered every 10 s). Focus is checked every 250 ms; chats you have already viewed switch instantly, new ones load in the background without freezing the window.
 
 ## License
 

@@ -24,8 +24,7 @@ import urllib.request
 from pathlib import Path
 
 LOG_ROOT = Path.home() / ".claude" / "projects"
-POLL_MS = 500
-RESCAN_EVERY = 4  # every Nth poll looks for the newest/focused log (~2 s)
+POLL_MS = 250
 
 # code: (symbol, decimals, symbol after the number, rough fallback rate per 1 USD)
 CURRENCIES = {
@@ -55,20 +54,35 @@ VIS_POLL_MS = 250
 
 
 def _session_roots():
-    """Claude Desktop metadata dirs. The Store build keeps %APPDATA% data in a package."""
-    roots = []
+    """Claude Desktop metadata dirs (claude-code-sessions). Desktop has kept them in
+    %APPDATA%, in the Store package's LocalCache and, in newer builds, in
+    %LOCALAPPDATA%\\Claude-Data\\<package>."""
+    pats = []
     local = os.environ.get("LOCALAPPDATA")
     if local:
-        pattern = os.path.join(local, "Packages", "Claude_*", "LocalCache",
-                               "Roaming", "Claude", "claude-code-sessions")
-        roots += [Path(p) for p in glob.glob(pattern)]
+        pats.append(os.path.join(local, "Claude-Data", "*", "claude-code-sessions"))
+        pats.append(os.path.join(local, "Claude-Data", "claude-code-sessions"))
+        pats.append(os.path.join(local, "Packages", "Claude_*", "LocalCache",
+                                 "Roaming", "Claude", "claude-code-sessions"))
     appdata = os.environ.get("APPDATA")
     if appdata:
-        roots.append(Path(appdata) / "Claude" / "claude-code-sessions")
+        pats.append(os.path.join(appdata, "Claude", "claude-code-sessions"))
+    roots = []
+    for pat in pats:
+        roots += [p for p in glob.glob(pat) if os.path.isdir(p)]
     return roots
 
 
-SESSIONS_ROOTS = _session_roots()
+_roots_cache = [0.0, []]
+
+
+def session_roots():
+    """Cached for 10 s, so a moved data folder is noticed without a restart."""
+    now = time.time()
+    if now - _roots_cache[0] > 10:
+        _roots_cache[:] = [now, _session_roots()]
+    return _roots_cache[1]
+
 
 # --- Prices (USD per 1M tokens): (input, output). Cache read 0.1x, write 1.25x (5 min) / 2x (1 h)
 # Edit these when Anthropic changes pricing. First substring match wins.
@@ -86,13 +100,13 @@ RATE_URL = "https://api.frankfurter.dev/v1/latest?base=USD&symbols="  # ECB rate
 RATE_REFRESH_S = 3600
 
 # --- Palette (Claude Desktop dark mode)
-BG = "#262624"
-BG_SOFT = "#30302E"
-BORDER = "#3D3D3A"
-FG = "#FAF9F5"
-MUTED = "#9C9A92"
+BG = "#191919"
+BG_SOFT = "#252525"
+BORDER = "#343434"
+FG = "#EFEFEF"
+MUTED = "#9C9C9C"
 ORANGE = "#D97757"
-TRACK = "#3A3A37"
+TRACK = "#2B2B2B"
 
 SERIF = ("Georgia", 11)
 SANS = "Segoe UI"
@@ -235,9 +249,9 @@ class Tooltip:
         self.tip = tk.Toplevel()
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        tk.Label(self.tip, text=self.text, justify="left", bg="#1B1B1A", fg=FG,
+        tk.Label(self.tip, text=self.text, justify="left", bg="#303030", fg=FG,
                  font=(SANS, 9), padx=9, pady=6,
-                 highlightthickness=1, highlightbackground=BORDER).pack()
+                 highlightthickness=1, highlightbackground="#454545").pack()
         self.tip.geometry(f"+{e.x_root + 14}+{e.y_root + 16}")
 
     def hide(self, _e=None):
@@ -247,64 +261,103 @@ class Tooltip:
 
 
 def newest_log():
+    """Most recently written log (one directory level, no deep walk)."""
     newest, newest_mtime = None, -1.0
-    if not LOG_ROOT.is_dir():
-        return None
-    for dirpath, _dirs, files in os.walk(LOG_ROOT):
-        for name in files:
-            if name.endswith(".jsonl"):
-                p = os.path.join(dirpath, name)
+    try:
+        with os.scandir(LOG_ROOT) as projects:
+            for pd in projects:
+                if not pd.is_dir():
+                    continue
                 try:
-                    m = os.path.getmtime(p)
+                    with os.scandir(pd.path) as files:
+                        for e in files:
+                            if e.name.endswith(".jsonl"):
+                                m = e.stat().st_mtime
+                                if m > newest_mtime:
+                                    newest, newest_mtime = e.path, m
                 except OSError:
                     continue
-                if m > newest_mtime:
-                    newest, newest_mtime = p, m
+    except OSError:
+        pass
     return newest
 
 
-_sess_cache = {}  # metadata path -> (mtime, cliSessionId, lastFocusedAt, priorCliSessionIds)
-_log_by_id = {}   # cliSessionId -> path to .jsonl
+_log_index = {}     # cliSessionId -> path to .jsonl
+_index_built = [0.0]
 
 
 def _find_log(cid):
-    path = _log_by_id.get(cid)
-    if not path or not os.path.exists(path):
-        path = None
-        for d in LOG_ROOT.glob(f"*/{cid}.jsonl"):
-            path = str(d)
-            _log_by_id[cid] = path
-            break
-    return path
+    path = _log_index.get(cid)
+    if path and os.path.exists(path):
+        return path
+    now = time.time()
+    if now - _index_built[0] < 2.0:   # missing logs must not trigger a scan every poll
+        return None
+    _index_built[0] = now
+    idx = {}
+    try:
+        with os.scandir(LOG_ROOT) as projects:
+            for pd in projects:
+                if not pd.is_dir():
+                    continue
+                try:
+                    with os.scandir(pd.path) as files:
+                        for e in files:
+                            if e.name.endswith(".jsonl"):
+                                idx[e.name[:-6]] = e.path
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    _log_index.clear()
+    _log_index.update(idx)
+    return _log_index.get(cid)
+
+
+def _iter_meta(root):
+    """Desktop's per-chat metadata files (local_*.json) below root."""
+    stack = [root]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                    elif e.name.startswith("local_") and e.name.endswith(".json"):
+                        yield e
+        except OSError:
+            continue
+
+
+_sess_cache = {}  # metadata path -> (mtime_ns, size, cliSessionId, lastFocusedAt, priorCliSessionIds)
 
 
 def focused_log():
-    """(log path, [paths of earlier logs of the same chat]) of the chat last
+    """(log path, (paths of earlier logs of the same chat)) of the chat last
     focused in Claude Desktop, or None. /clear and compaction start a new log;
-    Desktop lists the older ones in priorCliSessionIds."""
+    Desktop lists the older ones in priorCliSessionIds. Cheap enough to run
+    every poll: it only stats the metadata files and re-reads the changed ones."""
     best = None  # (lastFocusedAt, cliSessionId, priorCliSessionIds)
     seen = set()
-    walks = (w for root in SESSIONS_ROOTS if root.is_dir() for w in os.walk(root))
-    for dirpath, _dirs, files in walks:
-        for name in files:
-            if not (name.startswith("local_") and name.endswith(".json")):
-                continue
-            p = os.path.join(dirpath, name)
+    for root in session_roots():
+        for e in _iter_meta(root):
+            p = e.path
             seen.add(p)
             try:
-                m = os.path.getmtime(p)
-                if _sess_cache.get(p, (None,))[0] != m:
+                st = e.stat()
+                c = _sess_cache.get(p)
+                if not c or c[0] != st.st_mtime_ns or c[1] != st.st_size:
                     with open(p, "rb") as f:
                         d = json.load(f)
                     prior = d.get("priorCliSessionIds")
-                    _sess_cache[p] = (m, d.get("cliSessionId"),
-                                      d.get("lastFocusedAt") or 0,
-                                      prior if isinstance(prior, list) else [])
+                    c = _sess_cache[p] = (st.st_mtime_ns, st.st_size,
+                                          d.get("cliSessionId"),
+                                          d.get("lastFocusedAt") or 0,
+                                          prior if isinstance(prior, list) else [])
             except (OSError, ValueError):
                 continue
-            _m, cid, focus, prior = _sess_cache[p]
-            if cid and (best is None or focus > best[0]):
-                best = (focus, cid, prior)
+            if c[2] and (best is None or c[3] > best[0]):
+                best = (c[3], c[2], c[4])
     for p in set(_sess_cache) - seen:
         del _sess_cache[p]
     if not best:
@@ -318,26 +371,26 @@ def focused_log():
             pp = _find_log(pid)
             if pp and pp != path and pp not in older:
                 older.append(pp)
-    return path, older
+    return path, tuple(older)
 
 
-_old_cache = {}  # earlier log path -> (mtime, {message id: USD})
+_old_cache = {}  # earlier log path -> (mtime_ns, size, {message id: (USD, tokens)})
 
 
 def log_costs(path):
-    """{message id: USD} of every reply in an earlier log (cached by mtime)."""
+    """{message id: (USD, tokens)} of every reply in an earlier log (cached)."""
     try:
-        m = os.path.getmtime(path)
+        st = os.stat(path)
     except OSError:
         return {}
     hit = _old_cache.get(path)
-    if hit and hit[0] == m:
-        return hit[1]
+    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
     costs = {}
     try:
         with open(path, "rb") as f:
             for line in f:
-                if b'"usage"' not in line:
+                if b'"role":"assistant"' not in line or b'"usage"' not in line:
                     continue
                 try:
                     obj = json.loads(line)
@@ -350,10 +403,11 @@ def log_costs(path):
                 if not isinstance(usage, dict) or model == "<synthetic>":
                     continue
                 mid = msg.get("id") or obj.get("uuid") or f"{path}:{len(costs)}"
-                costs[mid] = sum(cost_parts_usd(model, usage))
+                costs[mid] = (sum(cost_parts_usd(model, usage)),
+                              sum(split_usage(usage)))
     except OSError:
         pass
-    _old_cache[path] = (m, costs)
+    _old_cache[path] = (st.st_mtime_ns, st.st_size, costs)
     return costs
 
 
@@ -371,22 +425,116 @@ def is_new_prompt(obj):
     return True
 
 
+class LogState:
+    """Everything the overlay shows for one log, updated by tailing the file."""
+
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+        self.turn = {}      # message id -> (model, usage) for the current request
+        self.session = {}   # message id -> (USD, tokens) for this log
+        self.last_model = None
+        self.last_usage = None
+        self.ctx_override = None   # context size right after a /compact
+        self.older_key = None      # earlier logs older_merged was computed for
+        self.older_merged = {}     # message id -> (USD, tokens) over those logs
+
+    def feed(self, line):
+        # cheap byte tests first: most lines (tool results, queue entries, ...)
+        # never need a JSON parse
+        if b'"role":"assistant"' in line and b'"usage"' in line:
+            pass
+        elif b'"type":"user"' in line:
+            if b'"type":"tool_result"' in line:
+                return
+        elif b"compact_boundary" not in line:
+            return
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(obj, dict):
+            return
+        if is_new_prompt(obj):
+            self.turn = {}
+            return
+        if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
+            post = (obj.get("compactMetadata") or {}).get("postTokens")
+            if isinstance(post, int):
+                self.ctx_override = post   # until the next reply reports real usage
+            return
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            return
+        usage = msg.get("usage")
+        model = msg.get("model")
+        if not isinstance(usage, dict) or model == "<synthetic>":
+            return
+        mid = msg.get("id") or obj.get("uuid") or str(len(self.session))
+        self.turn[mid] = (model, usage)  # same message is logged repeatedly; last wins
+        self.session[mid] = (sum(cost_parts_usd(model, usage)),
+                             sum(split_usage(usage)))
+        self.last_model, self.last_usage = model, usage
+        self.ctx_override = None
+
+    def read_new(self):
+        """Consume the complete lines added since the last call.
+        True = something new, False = nothing, None = file was rewritten."""
+        try:
+            size = os.path.getsize(self.path)
+            if size < self.offset:
+                return None
+            if size == self.offset:
+                return False
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return False
+        end = chunk.rfind(b"\n")  # complete lines only
+        if end == -1:
+            return False
+        self.offset += end + 1
+        for line in chunk[:end].split(b"\n"):
+            self.feed(line)
+        return True
+
+
+class Job:
+    """Loads a chat (replays its log, sums its earlier logs) off the UI thread."""
+
+    def __init__(self, path, older, need_state):
+        self.path, self.older = path, older
+        self.state, self.merged, self.error = None, {}, None
+        self.done = False
+        threading.Thread(target=self._run, args=(need_state,), daemon=True).start()
+
+    def _run(self, need_state):
+        try:
+            if need_state:
+                self.state = LogState(self.path)
+                self.state.read_new()
+            for p in self.older:
+                self.merged.update(log_costs(p))
+        except Exception as exc:
+            self.error = exc
+        self.done = True
+
+
 class Tracker:
     def __init__(self, root):
         self.root = root
         self.rate = Rate()
-        self.path = None
-        self.offset = 0
         self.tick = 0
-        self.turn = {}      # message id -> (model, usage) for the current request
-        self.session = {}   # message id -> USD cost for the current log
-        self.older = []     # earlier logs of this chat (before /clear or compaction)
-        self.older_merged = {}  # message id -> USD over those logs
-        self.older_usd = 0.0
-        self.last_model = None
-        self.last_usage = None
+        self.states = {}     # log path -> LogState, most recently used last
+        self.cur = None      # LogState on screen (None while a chat is loading)
+        self.want = None     # (log path, earlier log paths) of the focused chat
+        self.job = None      # Job loading the focused chat in the background
+        self.fallback = None
         self.values = {}
         self.costs = {}
+        self._txt = {}       # widget -> text shown, so unchanged labels are not redrawn
+        self._bar = None
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -431,15 +579,28 @@ class Tracker:
         # --- whole session
         sess = tk.Frame(frame, bg=BG_SOFT)
         sess.pack(fill="x", padx=16, pady=(12, 0))
-        s_name = tk.Label(sess, text="Whole session", bg=BG_SOFT, fg=MUTED,
+        top = tk.Frame(sess, bg=BG_SOFT)
+        top.pack(fill="x", pady=(6, 0))
+        s_name = tk.Label(top, text="Whole session", bg=BG_SOFT, fg=MUTED,
                           font=(SANS, 9), anchor="w")
-        s_name.pack(side="left", padx=(10, 0), pady=6)
-        self.sess_val = tk.Label(sess, text="–", bg=BG_SOFT, fg=FG,
+        s_name.pack(side="left", padx=(10, 0))
+        self.sess_val = tk.Label(top, text="–", bg=BG_SOFT, fg=FG,
                                  font=(MONO, 10, "bold"), anchor="e")
         self.sess_val.pack(side="right", padx=(0, 10))
-        Tooltip([sess, s_name, self.sess_val],
+        bot = tk.Frame(sess, bg=BG_SOFT)
+        bot.pack(fill="x", pady=(0, 6))
+        t_name = tk.Label(bot, text="Total tokens", bg=BG_SOFT, fg=MUTED,
+                          font=(SANS, 9), anchor="w")
+        t_name.pack(side="left", padx=(10, 0))
+        self.sess_tok = tk.Label(bot, text="–", bg=BG_SOFT, fg=FG,
+                                 font=(MONO, 10, "bold"), anchor="e")
+        self.sess_tok.pack(side="right", padx=(0, 10))
+        Tooltip([sess, top, s_name, self.sess_val],
                 "Sum of all replies in this chat, including the logs from\n"
                 "before /clear or compaction.")
+        Tooltip([bot, t_name, self.sess_tok],
+                "All tokens in this chat: input + output + cache read +\n"
+                "cache write, including logs from before /clear or compaction.")
 
         # --- token and cost rows
         grid = tk.Frame(frame, bg=BG)
@@ -507,7 +668,7 @@ class Tracker:
             hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
             dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
             dwm(hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)          # corners: round
-            dwm(hwnd, 34, ctypes.byref(ctypes.c_int(0x3A3D3D)), 4)   # border #3D3D3A
+            dwm(hwnd, 34, ctypes.byref(ctypes.c_int(0x343434)), 4)   # border #343434
         except Exception:
             pass
 
@@ -526,48 +687,37 @@ class Tracker:
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     # --- data
-    def reset(self):
-        self.turn.clear()
-        self.session.clear()
-        self.older_merged = {}
-        self.older_usd = 0.0
-        self.last_model = None
-        self.last_usage = None
-        self.ctx_override = None   # context size right after a /compact
+    def _set(self, widget, text):
+        if self._txt.get(widget) != text:
+            self._txt[widget] = text
+            widget.config(text=text)
 
-    def feed(self, line):
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            return
-        if not isinstance(obj, dict):
-            return
-        if is_new_prompt(obj):
-            self.turn = {}
-            return
-        if obj.get("type") == "system" and obj.get("subtype") == "compact_boundary":
-            post = (obj.get("compactMetadata") or {}).get("postTokens")
-            if isinstance(post, int):
-                self.ctx_override = post   # until the next reply reports real usage
-            return
-        msg = obj.get("message")
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            return
-        usage = msg.get("usage")
-        model = msg.get("model")
-        if not isinstance(usage, dict) or model == "<synthetic>":
-            return
-        mid = msg.get("id") or obj.get("uuid") or str(len(self.session))
-        self.turn[mid] = (model, usage)  # same message is logged repeatedly; last wins
-        self.session[mid] = sum(cost_parts_usd(model, usage))
-        self.last_model, self.last_usage = model, usage
-        self.ctx_override = None
+    def show_loading(self):
+        for key in self.values:
+            self._set(self.values[key], "–")
+            self._set(self.costs[key], "")
+        self._set(self.hero_val, "–")
+        self._set(self.hero_sub, "loading chat…")
+        self._set(self.sess_val, "–")
+        self._set(self.sess_tok, "–")
+        self._set(self.ctx_val, "–")
+        self._set(self.model_lbl, "")
+        self._set_bar(0)
+
+    def _set_bar(self, frac):
+        w = round(240 * min(1.0, frac))
+        if w != self._bar:
+            self._bar = w
+            self.bar.coords(self.bar_fill, 0, 0, w, 5)
 
     def render(self):
         rate = self.rate.value
+        st = self.cur
+        if st is None:
+            return
         sums = [0.0, 0.0, 0.0, 0.0]   # USD
         toks = [0, 0, 0, 0]
-        for model, usage in self.turn.values():
+        for model, usage in st.turn.values():
             for i, c in enumerate(cost_parts_usd(model, usage)):
                 sums[i] += c
             inp, out, cr, c5m, c1h = split_usage(usage)
@@ -575,100 +725,114 @@ class Tracker:
             toks[1] += out
             toks[2] += cr
             toks[3] += c5m + c1h
-        has = bool(self.turn)
+        has = bool(st.turn)
         for (key, _l, _t), t, c in zip(ROWS, toks, sums):
-            self.values[key].config(text=fmt(t) if has else "–")
-            self.costs[key].config(text=fmt_money(c, rate) if has else "")
-        self.hero_val.config(text=fmt_money(sum(sums), rate) if has else "–")
-        n = len(self.turn)
-        self.hero_sub.config(
-            text=f"last request incl. reply · {n} model calls" if n > 1
-            else "last request incl. reply")
-        total = sum(self.session.values()) + self.older_usd
-        self.sess_val.config(text=fmt_money(total, rate)
-                             if (self.session or self.older_usd) else "–")
+            self._set(self.values[key], fmt(t) if has else "–")
+            self._set(self.costs[key], fmt_money(c, rate) if has else "")
+        self._set(self.hero_val, fmt_money(sum(sums), rate) if has else "–")
+        n = len(st.turn)
+        self._set(self.hero_sub,
+                  f"last request incl. reply · {n} model calls" if n > 1
+                  else "last request incl. reply")
 
-        if self.last_usage:
-            inp, _o, cr, c5m, c1h = split_usage(self.last_usage)
+        # whole chat: this log + the earlier ones (a reply copied into this log by
+        # a rewind/fork is not counted twice)
+        rest = [v for mid, v in st.older_merged.items() if mid not in st.session]
+        has_sess = bool(st.session or rest)
+        total = sum(v[0] for v in st.session.values()) + sum(v[0] for v in rest)
+        tokens = sum(v[1] for v in st.session.values()) + sum(v[1] for v in rest)
+        self._set(self.sess_val, fmt_money(total, rate) if has_sess else "–")
+        self._set(self.sess_tok, fmt(tokens) if has_sess else "–")
+
+        if st.last_usage:
+            inp, _o, cr, c5m, c1h = split_usage(st.last_usage)
             ctx = inp + cr + c5m + c1h
-            if self.ctx_override is not None:
-                ctx = self.ctx_override
-            limit = context_limit(self.last_model)
-            self.ctx_val.config(text=f"{fmt(ctx)} / {fmt(limit // 1000)}k")
-            self.bar.coords(self.bar_fill, 0, 0, 240 * min(1.0, ctx / limit), 5)
-            self.model_lbl.config(text=(self.last_model or "").replace("claude-", ""))
-        if CURRENCY == "USD":
-            self.foot.config(text="prices: API list estimate, USD")
+            if st.ctx_override is not None:
+                ctx = st.ctx_override
+            limit = context_limit(st.last_model)
+            self._set(self.ctx_val, f"{fmt(ctx)} / {fmt(limit // 1000)}k")
+            self._set_bar(ctx / limit)
+            self._set(self.model_lbl, (st.last_model or "").replace("claude-", ""))
         else:
-            self.foot.config(
-                text=f"1 USD = {rate:,.2f} {CURRENCY} "
-                + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)"))
+            self._set(self.ctx_val, "–")
+            self._set(self.model_lbl, "")
+            self._set_bar(0)
+        if CURRENCY == "USD":
+            self._set(self.foot, "prices: API list estimate, USD")
+        else:
+            self._set(self.foot,
+                      f"1 USD = {rate:,.2f} {CURRENCY} "
+                      + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)"))
 
-    def load_older(self, older):
-        """Cost of the chat's earlier logs, shown in the whole-session total."""
-        self.older = list(older)
-        self.older_merged = {}
-        for p in self.older:
-            self.older_merged.update(log_costs(p))
-        self.update_older_usd()
-
-    def update_older_usd(self):
-        # a reply copied into the current log (rewind/fork) is not counted twice
-        self.older_usd = sum(c for mid, c in self.older_merged.items()
-                             if mid not in self.session)
-
-    def switch_to(self, path, older=()):
-        """Switch to a log file and replay its whole history."""
-        self.path = path
-        self.reset()
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-                self.offset = f.tell()
-            for line in data.decode("utf-8", "replace").splitlines():
-                self.feed(line)
-        except OSError:
-            self.offset = 0
-        self.load_older(older)
+    # --- switching chats
+    def activate(self, st):
+        """Put an already loaded chat on screen; instant for chats seen before."""
+        self.states.pop(st.path, None)
+        self.states[st.path] = st   # most recently used last
+        while len(self.states) > 6:
+            self.states.pop(next(iter(self.states)))
+        self.cur = st
+        if st.read_new() is None:   # file was rewritten: start over
+            self.states.pop(st.path, None)
+            self.cur = self.want = None
+            return
         self.render()
 
-    def read_new(self):
-        try:
-            size = os.path.getsize(self.path)
-            if size < self.offset:  # file truncated/rewritten
-                self.switch_to(self.path, self.older)
+    def apply_want(self):
+        """Show the focused chat if it is ready, else start loading it."""
+        if not self.want:
+            return
+        path, older = self.want
+        st = self.states.get(path)
+        if st is not None:
+            if self.cur is not st:
+                self.activate(st)   # shown at once, earlier-log sums may follow
+            if st.older_key == older:
                 return
-            if size == self.offset:
-                return
-            with open(self.path, "rb") as f:
-                f.seek(self.offset)
-                chunk = f.read()
-            end = chunk.rfind(b"\n")  # complete lines only
-            if end == -1:
-                return
-            self.offset += end + 1
-            for line in chunk[:end].decode("utf-8", "replace").splitlines():
-                self.feed(line)
-            self.update_older_usd()
-            self.render()
-        except OSError:
-            pass
+        elif self.cur is not None:
+            self.cur = None
+            self.show_loading()
+        if self.job is None:
+            self.job = Job(path, older, st is None)
+
+    def collect_job(self):
+        job = self.job
+        if job is None or not job.done:
+            return
+        self.job = None
+        if job.error is not None:
+            self.want = None   # try again on the next poll
+            return
+        if job.state is not None:
+            self.states[job.path] = job.state
+        st = self.states.get(job.path)
+        if st is not None:
+            st.older_key = job.older
+            st.older_merged = job.merged
+            if self.cur is st:
+                self.render()
+        self.apply_want()   # shows the chat, or loads the one focused meanwhile
 
     def poll(self):
         self.rate.maybe_refresh()
-        if self.path is None or self.tick % RESCAN_EVERY == 0:
-            found = focused_log()
-            latest, older = found if found else (newest_log(), [])
-            if latest and latest != self.path:
-                self.switch_to(latest, older)
-            elif latest and older != self.older:
-                self.load_older(older)
-                self.render()
         self.tick += 1
-        if self.path:
-            self.read_new()
-        if self.tick % 4 == 0:
-            self.render()  # also shows a freshly fetched rate
+        found = focused_log()
+        if found is None:   # no Desktop metadata: follow the newest log
+            if self.fallback is None or self.tick % 8 == 0:
+                newest = newest_log()
+                self.fallback = (newest, ()) if newest else None
+            found = self.fallback
+        if found and found != self.want:
+            self.want = found
+            self.apply_want()
+        self.collect_job()
+        if self.cur is not None:
+            changed = self.cur.read_new()
+            if changed is None:
+                self.states.pop(self.cur.path, None)
+                self.cur = self.want = None
+            elif changed or self.tick % 4 == 0:
+                self.render()   # every 4th poll also shows a freshly fetched rate
         self.root.after(POLL_MS, self.poll)
 
 
