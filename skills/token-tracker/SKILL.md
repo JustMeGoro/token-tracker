@@ -14,4 +14,4 @@ Make exactly ONE PowerShell call and nothing else (no prior checks, no sleep, no
 & "${CLAUDE_PLUGIN_ROOT}/scripts/launch.ps1"
 ```
 
-Then reply with one sentence: started, or already running. The window closes with a double-click or right-click.
+Then reply with one sentence: started, or already running. The arrow button next to ✕ expands or collapses it, ✕ closes it.

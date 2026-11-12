@@ -2,29 +2,61 @@
 
 Follows the chat that is focused in Claude Desktop (falls back to the most
 recently written log) and shows what the last request cost (your message plus
-the whole reply, including tool calls) and the whole session.
+the whole reply, including tool calls), the whole chat and today's total.
 
-Controls: drag = move, double-click / right-click / x = close.
+Controls: the arrow button next to the x = compact / expanded, drag = move, x = close.
 Hover a label or value for an explanation.
 
-Settings (environment variables):
+Settings live in ~/.claude/token-tracker.json (hand-edited, never written by the
+app); window position and compact/expanded are remembered in
+~/.claude/token-tracker-state.json. Environment variables override the config:
   TOKEN_TRACKER_CURRENCY   USD (default), EUR, GBP, CZK, PLN, CHF, JPY, CAD, AUD,
                            CNY, INR, SEK, NOK, DKK, KRW, BRL, MXN (daily ECB rate)
   TOKEN_TRACKER_HOST_EXE   exe whose window must be in front for the tracker to
                            show (default claude.exe). Set to "any" to always show.
+  TOKEN_TRACKER_LIMIT      limit for one chat in the display currency (0 = off)
 """
 import ctypes
 import glob
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-LOG_ROOT = Path.home() / ".claude" / "projects"
+_CLAUDE_DIR = Path.home() / ".claude"
+LOG_ROOT = Path(os.environ.get("TOKEN_TRACKER_LOGS") or _CLAUDE_DIR / "projects")
+CONFIG_PATH = Path(os.environ.get("TOKEN_TRACKER_CONFIG") or _CLAUDE_DIR / "token-tracker.json")
+STATE_PATH = Path(os.environ.get("TOKEN_TRACKER_STATE") or _CLAUDE_DIR / "token-tracker-state.json")
 POLL_MS = 250
+TODAY_EVERY_S = 30
+EXIT_AFTER_S = 60  # quit this long after the host app is gone
+
+
+def _read_json(path):
+    """A JSON object from a file; {} when it is missing or broken."""
+    try:
+        with open(path, "rb") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _number(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value == value and 0 <= value < float("inf") else default
+
+
+CONFIG = _read_json(CONFIG_PATH)
 
 # code: (symbol, decimals, symbol after the number, rough fallback rate per 1 USD)
 CURRENCIES = {
@@ -46,10 +78,12 @@ CURRENCIES = {
     "BRL": ("R$", 2, False, 5.5),
     "MXN": ("MX$", 2, False, 18.5),
 }
-CURRENCY = os.environ.get("TOKEN_TRACKER_CURRENCY", "USD").upper()
+CURRENCY = str(os.environ.get("TOKEN_TRACKER_CURRENCY") or CONFIG.get("currency") or "USD").upper()
 if CURRENCY not in CURRENCIES:
     CURRENCY = "USD"
-HOST_EXE = os.environ.get("TOKEN_TRACKER_HOST_EXE", "claude.exe").lower()
+HOST_EXE = str(os.environ.get("TOKEN_TRACKER_HOST_EXE") or CONFIG.get("host_exe") or "claude.exe").lower()
+LIMIT = _number(os.environ.get("TOKEN_TRACKER_LIMIT", CONFIG.get("limit", 0)))  # display currency
+AUTO_EXIT = CONFIG.get("auto_exit", False) is True
 VIS_POLL_MS = 250
 
 
@@ -85,8 +119,10 @@ def session_roots():
 
 
 # --- Prices (USD per 1M tokens): (input, output). Cache read 0.1x, write 1.25x (5 min) / 2x (1 h)
-# Edit these when Anthropic changes pricing. First substring match wins.
-PRICES = [
+# Add or override prices in the "prices" list of ~/.claude/token-tracker.json, e.g.
+#   "prices": [{"match": "opus-6", "input": 5, "output": 25}]
+# (entries there win over this table). First substring match wins.
+BUILTIN_PRICES = [
     ("fable", 10.0, 50.0),
     ("mythos", 10.0, 50.0),
     ("opus-5-5", 4.0, 20.0),
@@ -95,7 +131,34 @@ PRICES = [
     ("sonnet", 2.0, 10.0),
     ("haiku", 1.0, 5.0),
 ]
-DEFAULT_PRICE = (5.0, 25.0)  # unknown model = pessimistic estimate
+
+
+def _user_prices(cfg):
+    out = []
+    raw = cfg.get("prices")
+    for item in raw if isinstance(raw, list) else []:
+        try:
+            match, pin, pout = ((item["match"], item["input"], item["output"])
+                                if isinstance(item, dict) else item)
+            match, pin, pout = str(match).lower(), float(pin), float(pout)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if match and pin >= 0 and pout >= 0:
+            out.append((match, pin, pout))
+    return out
+
+
+def _default_price(cfg):
+    raw = cfg.get("default_price")
+    if isinstance(raw, list) and len(raw) == 2:
+        pin, pout = _number(raw[0], -1), _number(raw[1], -1)
+        if pin >= 0 and pout >= 0:
+            return pin, pout
+    return 5.0, 25.0  # unknown model = pessimistic estimate
+
+
+PRICES = _user_prices(CONFIG) + BUILTIN_PRICES
+DEFAULT_PRICE = _default_price(CONFIG)
 RATE_URL = "https://api.frankfurter.dev/v1/latest?base=USD&symbols="  # ECB rates, no key
 RATE_REFRESH_S = 3600
 
@@ -107,6 +170,7 @@ FG = "#EFEFEF"
 MUTED = "#9C9C9C"
 ORANGE = "#D97757"
 TRACK = "#2B2B2B"
+RED = "#E5534B"
 
 SERIF = ("Georgia", 11)
 SANS = "Segoe UI"
@@ -135,6 +199,12 @@ def price_for(model):
         if key in m:
             return pin, pout
     return DEFAULT_PRICE
+
+
+def known_model(model):
+    """False when the model matches no entry of the price table."""
+    m = (model or "").lower()
+    return not m or any(key in m for key, _i, _o in PRICES)
 
 
 def context_limit(model):
@@ -194,19 +264,81 @@ def foreground_exe():
         return "", 0
 
 
+def host_running():
+    """Is the host app (claude.exe) running at all? True when it cannot be told."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {HOST_EXE}", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000).stdout  # CREATE_NO_WINDOW
+        return HOST_EXE in out.lower()
+    except Exception:
+        return True
+
+
 def fmt(n):
     return f"{n:,}".replace(",", " ")
 
 
-def fmt_money(usd, rate):
+def fmt_money(usd, rate, unknown=False):
     sym, dec, after, _fb = CURRENCIES[CURRENCY]
     amount = usd * rate
     if CURRENCY == "USD" and amount < 0.1:
         dec = 4
     text = f"{amount:,.{dec}f}"
     if after:  # European style: 1 234,56 Kč
-        return text.replace(",", " ").replace(".", ",") + " " + sym
-    return sym + text
+        text = text.replace(",", " ").replace(".", ",") + " " + sym
+    else:
+        text = sym + text
+    return text + " ?" if unknown else text
+
+
+# --- remembered window state (position, compact / expanded)
+def load_state():
+    return _read_json(STATE_PATH)
+
+
+def save_state(state):
+    try:
+        tmp = str(STATE_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+
+
+def virtual_screen():
+    """(left, top, width, height) of all monitors together, or None."""
+    try:
+        u32 = ctypes.windll.user32
+        box = (u32.GetSystemMetrics(76), u32.GetSystemMetrics(77),
+               u32.GetSystemMetrics(78), u32.GetSystemMetrics(79))
+        return box if box[2] > 0 and box[3] > 0 else None
+    except Exception:
+        return None
+
+
+def fit_on_screen(x, y, w, h, screen):
+    """Move a w x h window at (x, y) so it lies inside the screen box."""
+    if not screen:
+        return x, y
+    sx, sy, sw, sh = screen
+    return (max(sx, min(x, sx + sw - w)), max(sy, min(y, sy + sh - h)))
+
+
+_mutex = []
+
+
+def already_running():
+    """Single-instance guard: True when another tracker holds the named mutex."""
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        _mutex.append(k32.CreateMutexW(None, False, "Local\\TokenTrackerOverlay"))
+        return k32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
 
 
 class Rate:
@@ -235,6 +367,8 @@ class Rate:
 
 
 class Tooltip:
+    """Hover text; `text` may be a function returning the current text."""
+
     def __init__(self, widgets, text):
         self.text = text
         self.tip = None
@@ -249,7 +383,8 @@ class Tooltip:
         self.tip = tk.Toplevel()
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        tk.Label(self.tip, text=self.text, justify="left", bg="#303030", fg=FG,
+        text = self.text() if callable(self.text) else self.text
+        tk.Label(self.tip, text=text, justify="left", bg="#303030", fg=FG,
                  font=(SANS, 9), padx=9, pady=6,
                  highlightthickness=1, highlightbackground="#454545").pack()
         self.tip.geometry(f"+{e.x_root + 14}+{e.y_root + 16}")
@@ -374,19 +509,19 @@ def focused_log():
     return path, tuple(older)
 
 
-_old_cache = {}  # earlier log path -> (mtime_ns, size, {message id: (USD, tokens)})
+_old_cache = {}  # earlier log path -> (mtime_ns, size, {message id: (USD, tokens)}, unknown models)
 
 
-def log_costs(path):
-    """{message id: (USD, tokens)} of every reply in an earlier log (cached)."""
+def log_info(path):
+    """({message id: (USD, tokens)}, {models without a price}) of an earlier log (cached)."""
     try:
         st = os.stat(path)
     except OSError:
-        return {}
+        return {}, set()
     hit = _old_cache.get(path)
     if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
-        return hit[2]
-    costs = {}
+        return hit[2], hit[3]
+    costs, unknown = {}, set()
     try:
         with open(path, "rb") as f:
             for line in f:
@@ -402,13 +537,19 @@ def log_costs(path):
                 usage, model = msg.get("usage"), msg.get("model")
                 if not isinstance(usage, dict) or model == "<synthetic>":
                     continue
+                if not known_model(model):
+                    unknown.add(model)
                 mid = msg.get("id") or obj.get("uuid") or f"{path}:{len(costs)}"
                 costs[mid] = (sum(cost_parts_usd(model, usage)),
                               sum(split_usage(usage)))
     except OSError:
         pass
-    _old_cache[path] = (st.st_mtime_ns, st.st_size, costs)
-    return costs
+    _old_cache[path] = (st.st_mtime_ns, st.st_size, costs, unknown)
+    return costs, unknown
+
+
+def log_costs(path):
+    return log_info(path)[0]
 
 
 def is_new_prompt(obj):
@@ -433,11 +574,14 @@ class LogState:
         self.offset = 0
         self.turn = {}      # message id -> (model, usage) for the current request
         self.session = {}   # message id -> (USD, tokens) for this log
+        self.unknown = set()       # models of this log without a price
         self.last_model = None
         self.last_usage = None
         self.ctx_override = None   # context size right after a /compact
         self.older_key = None      # earlier logs older_merged was computed for
         self.older_merged = {}     # message id -> (USD, tokens) over those logs
+        self.older_unknown = set()
+        self.over = None           # was the chat over the limit at the last look?
 
     def feed(self, line):
         # cheap byte tests first: most lines (tool results, queue entries, ...)
@@ -470,6 +614,8 @@ class LogState:
         model = msg.get("model")
         if not isinstance(usage, dict) or model == "<synthetic>":
             return
+        if not known_model(model):
+            self.unknown.add(model)
         mid = msg.get("id") or obj.get("uuid") or str(len(self.session))
         self.turn[mid] = (model, usage)  # same message is logged repeatedly; last wins
         self.session[mid] = (sum(cost_parts_usd(model, usage)),
@@ -505,7 +651,7 @@ class Job:
 
     def __init__(self, path, older, need_state):
         self.path, self.older = path, older
-        self.state, self.merged, self.error = None, {}, None
+        self.state, self.merged, self.unknown, self.error = None, {}, set(), None
         self.done = False
         threading.Thread(target=self._run, args=(need_state,), daemon=True).start()
 
@@ -515,16 +661,115 @@ class Job:
                 self.state = LogState(self.path)
                 self.state.read_new()
             for p in self.older:
-                self.merged.update(log_costs(p))
+                costs, unknown = log_info(p)
+                self.merged.update(costs)
+                self.unknown |= unknown
         except Exception as exc:
             self.error = exc
         self.done = True
+
+
+def local_midnight(now=None):
+    t = time.localtime(now)
+    return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+class Today:
+    """Cost of every reply since local midnight over all logs (CLI sessions and
+    subagents included), kept up to date by a background thread that only reads
+    what was appended to the logs since the last scan."""
+
+    def __init__(self, interval=TODAY_EVERY_S, start=True):
+        self.interval = interval
+        self.snapshot = None   # (USD, tokens, models without a price) once scanned
+        self._files = {}       # log path -> bytes consumed
+        self._msgs = {}        # message id -> (epoch, USD, tokens)
+        self._unknown = {}     # message id -> model without a price
+        self._stop = threading.Event()
+        if start:
+            threading.Thread(target=self._loop, daemon=True).start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self.scan()
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def scan(self, now=None):
+        cut = local_midnight(now)
+        cut_iso = datetime.fromtimestamp(cut, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S").encode()
+        seen = set()
+        for dirpath, _dirs, files in os.walk(LOG_ROOT):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                p = os.path.join(dirpath, name)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if st.st_mtime < cut:   # nothing from today in there
+                    continue
+                seen.add(p)
+                off = self._files.get(p, 0)
+                if st.st_size < off:    # rewritten: read again (ids dedupe)
+                    off = 0
+                if st.st_size > off:
+                    self._files[p] = self._read(p, off, cut, cut_iso)
+        for p in set(self._files) - seen:
+            del self._files[p]
+        self._msgs = {m: v for m, v in self._msgs.items() if v[0] >= cut}
+        self._unknown = {m: x for m, x in self._unknown.items() if m in self._msgs}
+        self.snapshot = (sum(v[1] for v in self._msgs.values()),
+                         sum(v[2] for v in self._msgs.values()),
+                         frozenset(self._unknown.values()))
+
+    def _read(self, path, off, cut, cut_iso):
+        try:
+            with open(path, "rb") as f:
+                f.seek(off)
+                chunk = f.read()
+        except OSError:
+            return off
+        end = chunk.rfind(b"\n")  # complete lines only
+        if end == -1:
+            return off
+        for line in chunk[:end].split(b"\n"):
+            if b'"role":"assistant"' not in line or b'"usage"' not in line:
+                continue
+            i = line.rfind(b'"timestamp":"')   # top-level key, after the message
+            if i != -1 and line[i + 13:i + 32] < cut_iso:
+                continue                        # older than today: skip the parse
+            try:
+                obj = json.loads(line)
+                msg = obj["message"]
+                usage, model = msg["usage"], msg.get("model")
+                ts = datetime.fromisoformat(
+                    obj["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            if model == "<synthetic>" or not isinstance(usage, dict) or ts < cut:
+                continue
+            mid = msg.get("id") or obj.get("uuid")
+            if not mid:
+                continue
+            self._msgs[mid] = (ts, sum(cost_parts_usd(model, usage)),
+                               sum(split_usage(usage)))
+            if not known_model(model):
+                self._unknown[mid] = model
+        return off + end + 1
 
 
 class Tracker:
     def __init__(self, root):
         self.root = root
         self.rate = Rate()
+        self.today = Today()
         self.tick = 0
         self.states = {}     # log path -> LogState, most recently used last
         self.cur = None      # LogState on screen (None while a chat is loading)
@@ -534,7 +779,20 @@ class Tracker:
         self.values = {}
         self.costs = {}
         self._txt = {}       # widget -> text shown, so unchanged labels are not redrawn
+        self._fgc = {}       # widget -> text colour set
         self._bar = None
+        self._unknown = set()   # models without a price in the chat on screen
+        self._over = False
+        self._alive_at = time.time()
+        self._quit = False
+        self._p0 = (0, 0)
+        self._moved = False
+        self._dx = self._dy = 0
+        self._frac = 0.0
+        self._applied = None   # (w, h) last set on the window
+
+        state = load_state()
+        self.compact = state.get("compact", True) is not False
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -542,29 +800,57 @@ class Tracker:
         root.configure(bg=BORDER)
 
         frame = tk.Frame(root, bg=BG)
-        frame.pack(padx=1, pady=1)
+        frame.pack(fill="both", expand=True, padx=1, pady=1)
         self.frame = frame
+        self.toggle_btns = set()   # the buttons that switch compact / expanded
+
+        # ---------------- compact line: session total + last request
+        cbox = tk.Frame(frame, bg=BG)
+        self.cbox = cbox
+        crow = tk.Frame(cbox, bg=BG)      # icon, total, (last request), arrow, x
+        crow.pack(fill="x")
+        self.crow = crow
+        c_close = tk.Label(crow, text="✕", bg=BG, fg=MUTED, font=(SANS, 9), cursor="hand2")
+        c_close.pack(side="right", padx=(10, 6))
+        self._wire_close(c_close)
+        self.c_toggle = self._toggle_button(crow, "▾", "Expand")
+        self.c_toggle.pack(side="right", padx=(10, 0))
+        c_icon = tk.Label(crow, text="✻", bg=BG, fg=ORANGE, font=(SANS, 12, "bold"))
+        c_icon.pack(side="left", padx=(12, 6), pady=8)
+        self.c_val = tk.Label(crow, text="–", bg=BG, fg=FG, font=(MONO, 11, "bold"))
+        self.c_val.pack(side="left")
+        self.c_sub = tk.Label(crow, text="", bg=BG, fg=MUTED, font=(SANS, 8))
+        self.c_sub.pack(side="left", padx=(8, 0))
+        self.c_icon = c_icon
+        Tooltip([cbox, crow, c_icon, self.c_val, self.c_sub],
+                lambda: "Whole chat so far, and the last request."
+                        + self._session_note())
+
+        # ---------------- expanded panel
+        full = tk.Frame(frame, bg=BG)
+        self.full = full
 
         # --- header
-        head = tk.Frame(frame, bg=BG)
+        head = tk.Frame(full, bg=BG)
         head.pack(fill="x", padx=16, pady=(14, 0))
-        tk.Label(head, text="✻", bg=BG, fg=ORANGE,
-                 font=(SANS, 14, "bold")).pack(side="left")
+        h_icon = tk.Label(head, text="✻", bg=BG, fg=ORANGE, font=(SANS, 14, "bold"))
+        h_icon.pack(side="left")
         self.title = tk.Label(head, text="Claude", bg=BG, fg=FG, font=SERIF)
         self.title.pack(side="left", padx=(6, 0))
         close = tk.Label(head, text="✕", bg=BG, fg=MUTED, font=(SANS, 9), cursor="hand2")
         close.pack(side="right")
-        close.bind("<Button-1>", lambda _e: self.root.destroy())
-        close.bind("<Enter>", lambda _e: close.config(fg=FG))
-        close.bind("<Leave>", lambda _e: close.config(fg=MUTED))
+        self._wire_close(close)
+        self.h_toggle = self._toggle_button(head, "▴", "Collapse")
+        self.h_toggle.pack(side="right", padx=(0, 10))
         self.model_lbl = tk.Label(head, text="", bg=BG, fg=MUTED, font=(SANS, 8))
         self.model_lbl.pack(side="right", padx=(0, 10))
-        Tooltip([self.title], "Token usage and cost from the focused chat's log\n"
-                              "in ~/.claude/projects. Prices are an estimate\n"
-                              "based on API list prices.")
+        Tooltip([head, h_icon, self.title, self.model_lbl],
+                "Token usage and cost from the focused chat's log\n"
+                "in ~/.claude/projects. Prices are an estimate\n"
+                "based on API list prices.")
 
         # --- hero number: cost of the last request
-        hero = tk.Frame(frame, bg=BG)
+        hero = tk.Frame(full, bg=BG)
         hero.pack(fill="x", padx=16, pady=(12, 0))
         self.hero_val = tk.Label(hero, text="–", bg=BG, fg=ORANGE,
                                  font=("Georgia", 24), anchor="w")
@@ -576,8 +862,8 @@ class Tracker:
                 "Cost of your last message plus everything Claude did in\n"
                 "the reply (output, tool calls, cache reads/writes).")
 
-        # --- whole session
-        sess = tk.Frame(frame, bg=BG_SOFT)
+        # --- whole session, total tokens, today
+        sess = tk.Frame(full, bg=BG_SOFT)
         sess.pack(fill="x", padx=16, pady=(12, 0))
         top = tk.Frame(sess, bg=BG_SOFT)
         top.pack(fill="x", pady=(6, 0))
@@ -587,23 +873,36 @@ class Tracker:
         self.sess_val = tk.Label(top, text="–", bg=BG_SOFT, fg=FG,
                                  font=(MONO, 10, "bold"), anchor="e")
         self.sess_val.pack(side="right", padx=(0, 10))
-        bot = tk.Frame(sess, bg=BG_SOFT)
-        bot.pack(fill="x", pady=(0, 6))
-        t_name = tk.Label(bot, text="Total tokens", bg=BG_SOFT, fg=MUTED,
+        mid = tk.Frame(sess, bg=BG_SOFT)
+        mid.pack(fill="x")
+        t_name = tk.Label(mid, text="Total tokens", bg=BG_SOFT, fg=MUTED,
                           font=(SANS, 9), anchor="w")
         t_name.pack(side="left", padx=(10, 0))
-        self.sess_tok = tk.Label(bot, text="–", bg=BG_SOFT, fg=FG,
+        self.sess_tok = tk.Label(mid, text="–", bg=BG_SOFT, fg=FG,
                                  font=(MONO, 10, "bold"), anchor="e")
         self.sess_tok.pack(side="right", padx=(0, 10))
+        bot = tk.Frame(sess, bg=BG_SOFT)
+        bot.pack(fill="x", pady=(0, 6))
+        d_name = tk.Label(bot, text="Today (all chats)", bg=BG_SOFT, fg=MUTED,
+                          font=(SANS, 9), anchor="w")
+        d_name.pack(side="left", padx=(10, 0))
+        self.today_val = tk.Label(bot, text="–", bg=BG_SOFT, fg=FG,
+                                  font=(MONO, 10, "bold"), anchor="e")
+        self.today_val.pack(side="right", padx=(0, 10))
         Tooltip([sess, top, s_name, self.sess_val],
-                "Sum of all replies in this chat, including the logs from\n"
-                "before /clear or compaction.")
-        Tooltip([bot, t_name, self.sess_tok],
+                lambda: "Sum of all replies in this chat, including the logs from\n"
+                        "before /clear or compaction." + self._session_note())
+        Tooltip([mid, t_name, self.sess_tok],
                 "All tokens in this chat: input + output + cache read +\n"
                 "cache write, including logs from before /clear or compaction.")
+        Tooltip([bot, d_name, self.today_val],
+                lambda: "Everything spent since midnight (your local time) over all\n"
+                        "chats in ~/.claude/projects, including Claude Code CLI\n"
+                        "sessions and subagents. Refreshed every 30 s."
+                        + self._unknown_note(self.today_unknown()))
 
         # --- token and cost rows
-        grid = tk.Frame(frame, bg=BG)
+        grid = tk.Frame(full, bg=BG)
         grid.pack(fill="x", padx=16, pady=(10, 0))
         for key, label, tip in ROWS:
             row = tk.Frame(grid, bg=BG)
@@ -622,8 +921,8 @@ class Tracker:
             Tooltip([row, name, val, money], f"{label}\n{tip}")
 
         # --- context
-        tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(10, 8))
-        ctx_head = tk.Frame(frame, bg=BG)
+        tk.Frame(full, bg=BORDER, height=1).pack(fill="x", padx=16, pady=(10, 8))
+        ctx_head = tk.Frame(full, bg=BG)
         ctx_head.pack(fill="x", padx=16)
         ctx_name = tk.Label(ctx_head, text="Context", bg=BG, fg=FG,
                             font=(SANS, 9, "bold"), anchor="w")
@@ -631,24 +930,93 @@ class Tracker:
         self.ctx_val = tk.Label(ctx_head, text="–", bg=BG, fg=FG,
                                 font=(MONO, 10, "bold"), anchor="e")
         self.ctx_val.pack(side="right")
-        self.bar = tk.Canvas(frame, width=240, height=5, bg=TRACK,
+        self.bar = tk.Canvas(full, width=150, height=5, bg=TRACK,
                              highlightthickness=0)
-        self.bar.pack(padx=16, pady=(5, 0))
+        self.bar.pack(fill="x", padx=16, pady=(5, 0))
+        self.bar.bind("<Configure>", lambda _e: self._set_bar(self._frac))
         self.bar_fill = self.bar.create_rectangle(0, 0, 0, 5, fill=ORANGE, width=0)
-        self.foot = tk.Label(frame, text="", bg=BG, fg=MUTED, font=(SANS, 8), anchor="w")
+        self.foot = tk.Label(full, text="", bg=BG, fg=MUTED, font=(SANS, 8),
+                             anchor="w", justify="left")
         self.foot.pack(fill="x", padx=16, pady=(8, 12))
         Tooltip([ctx_head, ctx_name, self.ctx_val, self.bar],
                 "How many tokens the model saw in the last reply in total\n"
                 "(input + cache read + cache write) versus the window limit.")
 
         self._bind_window(root)
-        root.update_idletasks()
+        x, y = state.get("x"), state.get("y")
+        if not (isinstance(x, int) and isinstance(y, int)):
+            x, y = 40, 40
+        root.geometry(f"+{x}+{y}")
+        self.layout(x, y)
+        self.save_state()   # also clears a "closed" flag left by the last run
         self._round_corners()
         self.visible = True
         self.poll()
         self.watch_host()
+        self.root.after(15000, self.watch_claude)
 
     # --- window
+    def _wire_close(self, label):
+        # after_idle: the window's own press / release handlers still run for this click
+        label.bind("<Button-1>", lambda _e: self.root.after_idle(self.close))
+        label.bind("<Enter>", lambda _e: label.config(fg=FG))
+        label.bind("<Leave>", lambda _e: label.config(fg=MUTED))
+
+    def _toggle_button(self, parent, glyph, tip):
+        """Small arrow button that switches between the compact line and the panel."""
+        b = tk.Label(parent, text=glyph, bg=BG, fg=MUTED, font=(SANS, 13), cursor="hand2")
+        b.bind("<Enter>", lambda _e: b.config(fg=FG), add="+")
+        b.bind("<Leave>", lambda _e: b.config(fg=MUTED), add="+")
+        Tooltip([b], tip)
+        self.toggle_btns.add(b)
+        return b
+
+    def close(self):
+        """The x: quit, and stay off until the user starts it by hand again."""
+        self.save_state(closed=True)
+        self.root.destroy()
+
+    def layout(self, x=None, y=None):
+        """Show the compact line or the expanded panel and keep the window on screen."""
+        if self.compact:
+            self.full.pack_forget()
+            self.cbox.pack(fill="x")
+        else:
+            self.cbox.pack_forget()
+            self.full.pack(fill="x")
+        self.root.update_idletasks()
+        x = self.root.winfo_x() if x is None else x
+        y = self.root.winfo_y() if y is None else y
+        w, h = self._size()
+        x, y = fit_on_screen(x, y, w, h, virtual_screen())
+        self._applied = (w, h)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _size(self):
+        """Window size: the content size (the width is fixed)."""
+        self.root.update_idletasks()
+        w = self.root.winfo_reqwidth()
+        return w, self.root.winfo_reqheight()
+
+    def fit(self):
+        """Re-apply the size when the content got taller / wider (explicit size stops auto-fit)."""
+        self.root.update_idletasks()
+        size = self._size()
+        if size != self._applied:
+            self._applied = size
+            self.root.geometry(f"{size[0]}x{size[1]}")
+
+    def toggle(self):
+        self.compact = not self.compact
+        self.layout()
+        self.save_state()
+        self.render()
+
+    def save_state(self, closed=False):
+        self.root.update_idletasks()   # apply a pending geometry() before reading the position
+        save_state({"x": self.root.winfo_x(), "y": self.root.winfo_y(),
+                    "compact": self.compact, "closed": closed})
+
     def watch_host(self):
         """Show the window only while Claude Desktop (or the tracker) is in front."""
         exe, pid = foreground_exe()
@@ -662,6 +1030,19 @@ class Tracker:
             self.visible = False
         self.root.after(VIS_POLL_MS, self.watch_host)
 
+    def watch_claude(self):
+        """Quit once the host app has been gone for a minute (it was started by a hook)."""
+        if AUTO_EXIT and HOST_EXE != "any":
+            threading.Thread(target=self._probe_host, daemon=True).start()
+        self.root.after(15000, self.watch_claude)
+
+    def _probe_host(self):
+        now = time.time()
+        if host_running():
+            self._alive_at = now
+        elif now - self._alive_at > EXIT_AFTER_S:
+            self._quit = True
+
     def _round_corners(self):
         """Windows 11: rounded corners and a dark border (silently ignored on older)."""
         try:
@@ -672,19 +1053,30 @@ class Tracker:
         except Exception:
             pass
 
-    def _bind_window(self, w):
-        w.bind("<ButtonPress-1>", self._drag_start, add="+")
-        w.bind("<B1-Motion>", self._drag_move, add="+")
-        w.bind("<Double-Button-1>", lambda _e: self.root.destroy(), add="+")
-        w.bind("<Button-3>", lambda _e: self.root.destroy(), add="+")
-        for c in w.winfo_children():
-            self._bind_window(c)
+    def _bind_window(self, root):
+        # Bound once, on the toplevel only: every event of a child widget also
+        # reaches the toplevel's bindings (bindtags), so binding each child as
+        # well made each click fire twice and the toggle cancel itself out.
+        root.bind("<ButtonPress-1>", self._press, add="+")
+        root.bind("<B1-Motion>", self._motion, add="+")
+        root.bind("<ButtonRelease-1>", self._release, add="+")
 
-    def _drag_start(self, e):
+    def _press(self, e):
         self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
+        self._p0 = (e.x_root, e.y_root)
+        self._moved = False
 
-    def _drag_move(self, e):
-        self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+    def _motion(self, e):
+        if abs(e.x_root - self._p0[0]) + abs(e.y_root - self._p0[1]) > 4:
+            self._moved = True
+        if self._moved:
+            self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _release(self, e):
+        if self._moved:
+            self.save_state()
+        elif e.widget in self.toggle_btns:
+            self.toggle()
 
     # --- data
     def _set(self, widget, text):
@@ -692,23 +1084,56 @@ class Tracker:
             self._txt[widget] = text
             widget.config(text=text)
 
+    def _fg(self, widget, color):
+        if self._fgc.get(widget) != color:
+            self._fgc[widget] = color
+            widget.config(fg=color)
+
+    def today_unknown(self):
+        snap = self.today.snapshot
+        return set(snap[2]) if snap else set()
+
+    def _unknown_note(self, models):
+        if not models:
+            return ""
+        return ("\n\n? No price known for: " + ", ".join(sorted(map(str, models)))
+                + f"\nIt is counted at the default ${DEFAULT_PRICE[0]:g} in / "
+                  f"${DEFAULT_PRICE[1]:g} out per 1M tokens.\n"
+                  'Add it under "prices" in ~/.claude/token-tracker.json.')
+
+    def _session_note(self):
+        note = ""
+        if LIMIT > 0:
+            note += f"\n\nLimit for one chat: {fmt_money(LIMIT / self.rate.value, self.rate.value)}"
+        return note + self._unknown_note(self._unknown)
+
+    def _set_bar(self, frac):
+        self._frac = frac
+        w = round(max(self.bar.winfo_width(), 1) * min(1.0, frac))
+        if w != self._bar:
+            self._bar = w
+            self.bar.coords(self.bar_fill, 0, 0, w, 5)
+
     def show_loading(self):
         for key in self.values:
             self._set(self.values[key], "–")
             self._set(self.costs[key], "")
-        self._set(self.hero_val, "–")
+        for w in (self.hero_val, self.sess_val, self.sess_tok, self.ctx_val, self.c_val):
+            self._set(w, "–")
         self._set(self.hero_sub, "loading chat…")
-        self._set(self.sess_val, "–")
-        self._set(self.sess_tok, "–")
-        self._set(self.ctx_val, "–")
+        self._set(self.c_sub, "loading…")
         self._set(self.model_lbl, "")
         self._set_bar(0)
 
-    def _set_bar(self, frac):
-        w = round(240 * min(1.0, frac))
-        if w != self._bar:
-            self._bar = w
-            self.bar.coords(self.bar_fill, 0, 0, w, 5)
+    def flash(self, n=6):
+        """Blink the border and the total once when a chat crosses the limit."""
+        on = n > 0 and n % 2 == 0
+        self.root.configure(bg=RED if on else BORDER)
+        for w, normal in ((self.sess_val, BG_SOFT), (self.c_val, BG)):
+            w.config(bg=RED if on else normal,
+                     fg="#FFFFFF" if on else self._fgc.get(w, FG))
+        if n > 0:
+            self.root.after(180, self.flash, n - 1)
 
     def render(self):
         rate = self.rate.value
@@ -726,10 +1151,12 @@ class Tracker:
             toks[2] += cr
             toks[3] += c5m + c1h
         has = bool(st.turn)
+        turn_unknown = any(not known_model(m) for m, _u in st.turn.values())
         for (key, _l, _t), t, c in zip(ROWS, toks, sums):
             self._set(self.values[key], fmt(t) if has else "–")
             self._set(self.costs[key], fmt_money(c, rate) if has else "")
-        self._set(self.hero_val, fmt_money(sum(sums), rate) if has else "–")
+        self._set(self.hero_val,
+                  fmt_money(sum(sums), rate, turn_unknown) if has else "–")
         n = len(st.turn)
         self._set(self.hero_sub,
                   f"last request incl. reply · {n} model calls" if n > 1
@@ -741,8 +1168,26 @@ class Tracker:
         has_sess = bool(st.session or rest)
         total = sum(v[0] for v in st.session.values()) + sum(v[0] for v in rest)
         tokens = sum(v[1] for v in st.session.values()) + sum(v[1] for v in rest)
-        self._set(self.sess_val, fmt_money(total, rate) if has_sess else "–")
+        self._unknown = st.unknown | st.older_unknown
+        shown = fmt_money(total, rate, bool(self._unknown)) if has_sess else "–"
+        self._set(self.sess_val, shown)
+        self._set(self.c_val, shown)
         self._set(self.sess_tok, fmt(tokens) if has_sess else "–")
+        self._set(self.c_sub, f"last {fmt_money(sum(sums), rate, turn_unknown)}" if has else "")
+
+        # limit: red while over it, one flash when a chat crosses it while watched
+        over = LIMIT > 0 and has_sess and total * rate >= LIMIT
+        color = RED if over else FG
+        self._fg(self.sess_val, color)
+        self._fg(self.c_val, color)
+        if st.older_key is not None:   # earlier logs counted: the total is complete
+            if over and st.over is False:
+                self.flash()
+            st.over = bool(over)
+
+        snap = self.today.snapshot
+        self._set(self.today_val,
+                  fmt_money(snap[0], rate, bool(snap[2])) if snap else "–")
 
         if st.last_usage:
             inp, _o, cr, c5m, c1h = split_usage(st.last_usage)
@@ -757,12 +1202,16 @@ class Tracker:
             self._set(self.ctx_val, "–")
             self._set(self.model_lbl, "")
             self._set_bar(0)
+        note = "estimate at API list prices, not your bill"
         if CURRENCY == "USD":
-            self._set(self.foot, "prices: API list estimate, USD")
+            self._set(self.foot, note)
         else:
             self._set(self.foot,
                       f"1 USD = {rate:,.2f} {CURRENCY} "
-                      + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)"))
+                      + ("(ECB)" if self.rate.live else "(estimate, rate not fetched)")
+                      + "\n" + note)
+
+        self.fit()
 
     # --- switching chats
     def activate(self, st):
@@ -809,11 +1258,15 @@ class Tracker:
         if st is not None:
             st.older_key = job.older
             st.older_merged = job.merged
+            st.older_unknown = job.unknown
             if self.cur is st:
                 self.render()
         self.apply_want()   # shows the chat, or loads the one focused meanwhile
 
     def poll(self):
+        if self._quit:
+            self.root.destroy()
+            return
         self.rate.maybe_refresh()
         self.tick += 1
         found = focused_log()
@@ -832,12 +1285,16 @@ class Tracker:
                 self.states.pop(self.cur.path, None)
                 self.cur = self.want = None
             elif changed or self.tick % 4 == 0:
-                self.render()   # every 4th poll also shows a freshly fetched rate
+                self.render()   # every 4th poll also shows a fresh rate / today total
         self.root.after(POLL_MS, self.poll)
 
 
 if __name__ == "__main__":
+    if already_running():
+        sys.exit(0)
+    if "--autostart" in sys.argv and (CONFIG.get("autostart", True) is False
+                                      or load_state().get("closed") is True):
+        sys.exit(0)
     r = tk.Tk()
-    r.geometry("+40+40")
     Tracker(r)
     r.mainloop()
